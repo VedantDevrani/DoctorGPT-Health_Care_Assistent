@@ -188,7 +188,7 @@ const FeatureCard = ({ icon, title, description, color, delay }) => {
       whileInView={{ opacity: 1, y: 0 }}
       viewport={{ once: true }}
       transition={{ duration: 0.5, delay }}
-      className="p-8 bg-white border border-slate-100 rounded-[32px] hover:border-medical-200 hover:shadow-2xl hover:shadow-medical-100/20 transition-all group"
+      className="p-8 bg-white border border-slate-100 rounded-4xl hover:border-medical-200 hover:shadow-2xl hover:shadow-medical-100/20 transition-all group"
     >
       <div className={`w-14 h-14 rounded-2xl flex items-center justify-center mb-6 transition-transform group-hover:scale-110 ${colorStyles}`}>
         {icon}
