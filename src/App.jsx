@@ -3,16 +3,51 @@ import LandingPage from './components/LandingPage';
 import InputForm from './components/InputForm';
 import ResultsPanel from './components/ResultsPanel';
 import { motion, AnimatePresence } from 'framer-motion';
-import { onAuthStateChanged, signInWithEmailAndPassword, signOut } from 'firebase/auth';
-import { auth, hasFirebaseConfig } from './firebase';
+import {
+  createUserWithEmailAndPassword,
+  GoogleAuthProvider,
+  onAuthStateChanged,
+  signInWithEmailAndPassword,
+  signInWithPopup,
+  signOut,
+} from 'firebase/auth';
+import { addDoc, collection } from 'firebase/firestore';
+import { auth, db, hasFirebaseConfig } from './firebase';
 import './App.css';
 
+const OTP_TTL_MS = 90 * 60 * 1000;
+const OTP_PENDING_STORAGE_KEY = 'doctorgpt_pending_otp';
+const OTP_VERIFIED_EMAILS_KEY = 'doctorgpt_verified_otp_emails';
+
+const readJsonStorage = (key, fallback) => {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : fallback;
+  } catch {
+    return fallback;
+  }
+};
+
+const writeJsonStorage = (key, value) => {
+  localStorage.setItem(key, JSON.stringify(value));
+};
+
+const generateSixDigitOtp = () => {
+  return String(Math.floor(100000 + Math.random() * 900000));
+};
+
 function App() {
+  const [authUser, setAuthUser] = useState(null);
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [authLoading, setAuthLoading] = useState(true);
+  const [authSubmitting, setAuthSubmitting] = useState(false);
+  const [authMode, setAuthMode] = useState('login');
   const [showLoginModal, setShowLoginModal] = useState(false);
   const [credentials, setCredentials] = useState({ email: '', password: '' });
   const [loginError, setLoginError] = useState('');
+  const [authNotice, setAuthNotice] = useState('');
+  const [otpInput, setOtpInput] = useState('');
+  const [pendingOtp, setPendingOtp] = useState(() => readJsonStorage(OTP_PENDING_STORAGE_KEY, null));
 
   const [showApp, setShowApp] = useState(false);
   const [formData, setFormData] = useState({
@@ -36,6 +71,14 @@ function App() {
   const chatEndRef = useRef(null);
 
   useEffect(() => {
+    if (pendingOtp) {
+      writeJsonStorage(OTP_PENDING_STORAGE_KEY, pendingOtp);
+      return;
+    }
+    localStorage.removeItem(OTP_PENDING_STORAGE_KEY);
+  }, [pendingOtp]);
+
+  useEffect(() => {
     if (isAuthenticated) {
       chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     }
@@ -48,7 +91,28 @@ function App() {
     }
 
     const unsubscribe = onAuthStateChanged(auth, (user) => {
-      setIsAuthenticated(Boolean(user));
+      setAuthUser(user || null);
+
+      if (!user) {
+        setIsAuthenticated(false);
+        setAuthLoading(false);
+        return;
+      }
+
+      const usesPasswordProvider = user.providerData.some((provider) => provider.providerId === 'password');
+      const verifiedOtpEmails = readJsonStorage(OTP_VERIFIED_EMAILS_KEY, {});
+      const otpVerified = Boolean(verifiedOtpEmails[user.email || '']);
+      const canAccessChat = !usesPasswordProvider || otpVerified;
+
+      setIsAuthenticated(canAccessChat);
+
+      if (!canAccessChat) {
+        setAuthNotice('Please verify your email with OTP to access chat.');
+        setAuthMode('login');
+        setShowLoginModal(true);
+        signOut(auth).catch(() => {});
+      }
+
       setAuthLoading(false);
     });
 
@@ -98,7 +162,35 @@ function App() {
     setCredentials((prev) => ({ ...prev, [name]: value }));
   };
 
-  const handleLogin = async (event) => {
+  const isValidEmail = (email) => {
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+  };
+
+  const queueOtpMail = async ({ email, otp, expiresAt }) => {
+    if (!db) return;
+
+    const expiresAtText = new Date(expiresAt).toLocaleString();
+
+    await addDoc(collection(db, 'mail'), {
+      to: [email],
+      message: {
+        subject: 'DoctorGPT OTP Verification - Thank You For Joining',
+        text:
+          `Thank you for joining and trusting DoctorGPT.\n\n` +
+          `Your OTP is: ${otp}\n` +
+          `This OTP is valid until: ${expiresAtText} (about 1 hour 30 minutes).\n\n` +
+          `If you did not request this, please ignore this email.`,
+        html:
+          `<p>Thank you for joining and trusting <strong>DoctorGPT</strong>.</p>` +
+          `<p>Your verification OTP is:</p>` +
+          `<h2 style="letter-spacing: 4px;">${otp}</h2>` +
+          `<p>This OTP is valid until <strong>${expiresAtText}</strong> (about 1 hour 30 minutes).</p>` +
+          `<p>If you did not request this, you can ignore this email.</p>`,
+      },
+    });
+  };
+
+  const handleEmailAuth = async (event) => {
     event.preventDefault();
 
     const email = credentials.email.trim();
@@ -114,11 +206,58 @@ function App() {
       return;
     }
 
+    if (!isValidEmail(email)) {
+      setLoginError('Please enter a valid email format (example: name@example.com).');
+      return;
+    }
+
+    if (authMode === 'signup' && password.length < 6) {
+      setLoginError('Password must be at least 6 characters.');
+      return;
+    }
+
+    setAuthSubmitting(true);
+
     try {
-      await signInWithEmailAndPassword(auth, email, password);
+      if (authMode === 'signup') {
+        await createUserWithEmailAndPassword(auth, email, password);
+
+        const otp = generateSixDigitOtp();
+        const expiresAt = Date.now() + OTP_TTL_MS;
+        const nextPendingOtp = { email, otp, expiresAt };
+
+        setPendingOtp(nextPendingOtp);
+        await queueOtpMail({ email, otp, expiresAt });
+        await signOut(auth);
+
+        setAuthMode('verify-otp');
+        setOtpInput('');
+        setAuthNotice('We sent a 6-digit OTP with a thank-you note to your email. Enter it below to verify.');
+        setLoginError('');
+        return;
+      } else {
+        const userCredential = await signInWithEmailAndPassword(auth, email, password);
+        const user = userCredential.user;
+        const usesPasswordProvider = user.providerData.some((provider) => provider.providerId === 'password');
+
+        const verifiedOtpEmails = readJsonStorage(OTP_VERIFIED_EMAILS_KEY, {});
+        const otpVerified = Boolean(verifiedOtpEmails[email]);
+
+        if (usesPasswordProvider && !otpVerified) {
+          setLoginError('Email is not OTP-verified. Please complete verification first.');
+          setAuthNotice('Please use signup verification OTP flow to verify your email.');
+          await signOut(auth);
+          return;
+        }
+      }
+
       setCredentials({ email: '', password: '' });
       setLoginError('');
-      setShowLoginModal(false);
+      setAuthNotice('');
+
+      if (authMode !== 'signup') {
+        setShowLoginModal(false);
+      }
     } catch (error) {
       const code = error?.code || 'auth/unknown';
 
@@ -132,7 +271,119 @@ function App() {
         return;
       }
 
+      if (code === 'auth/email-already-in-use') {
+        setLoginError('This email is already registered. Please login instead.');
+        return;
+      }
+
+      if (code === 'auth/popup-closed-by-user') {
+        setLoginError('Login popup was closed before completing sign in.');
+        return;
+      }
+
       setLoginError('Login failed. Please try again.');
+    } finally {
+      setAuthSubmitting(false);
+    }
+  };
+
+  const handleResendVerification = async () => {
+    if (authMode !== 'verify-otp' || !pendingOtp) {
+      setLoginError('No OTP verification is currently pending.');
+      return;
+    }
+
+    if (Date.now() < pendingOtp.expiresAt) {
+      const remainingMinutes = Math.ceil((pendingOtp.expiresAt - Date.now()) / 60000);
+      setLoginError(`Current OTP is still valid. Try again in about ${remainingMinutes} minute(s).`);
+      return;
+    }
+
+    const correctedEmail = credentials.email.trim();
+
+    if (!isValidEmail(correctedEmail)) {
+      setLoginError('Enter a valid corrected email before resending OTP.');
+      return;
+    }
+
+    setAuthSubmitting(true);
+
+    try {
+      const otp = generateSixDigitOtp();
+      const expiresAt = Date.now() + OTP_TTL_MS;
+      const nextPendingOtp = { email: correctedEmail, otp, expiresAt };
+
+      setPendingOtp(nextPendingOtp);
+      await queueOtpMail({ email: correctedEmail, otp, expiresAt });
+      setOtpInput('');
+      setAuthNotice('A new OTP has been sent with a thank-you note. Please verify within 1 hour 30 minutes.');
+      setLoginError('');
+    } catch {
+      setLoginError('Could not resend OTP email. Please try again.');
+    } finally {
+      setAuthSubmitting(false);
+    }
+  };
+
+  const handleConfirmOtp = async () => {
+    if (!pendingOtp) {
+      setLoginError('No pending OTP found. Please sign up again.');
+      return;
+    }
+
+    if (Date.now() > pendingOtp.expiresAt) {
+      setLoginError('OTP expired. Update the email and request a new OTP.');
+      setAuthNotice('OTP expired after 1 hour 30 minutes. You can now resend with corrected email.');
+      return;
+    }
+
+    if (!/^\d{6}$/.test(otpInput)) {
+      setLoginError('OTP must be exactly 6 digits.');
+      return;
+    }
+
+    if (otpInput !== pendingOtp.otp) {
+      setLoginError('Invalid OTP. Please check and try again.');
+      return;
+    }
+
+    const email = pendingOtp.email;
+    const verifiedOtpEmails = readJsonStorage(OTP_VERIFIED_EMAILS_KEY, {});
+    verifiedOtpEmails[email] = true;
+    writeJsonStorage(OTP_VERIFIED_EMAILS_KEY, verifiedOtpEmails);
+
+    setPendingOtp(null);
+    setOtpInput('');
+    setAuthMode('login');
+    setCredentials((prev) => ({ ...prev, email }));
+    setAuthNotice('OTP verified successfully. You can now login.');
+    setLoginError('');
+  };
+
+  const handleGoogleLogin = async () => {
+    if (!hasFirebaseConfig || !auth) {
+      setLoginError('Firebase is not configured yet. Add your Firebase keys to .env and restart the app.');
+      return;
+    }
+
+    setAuthSubmitting(true);
+
+    try {
+      const provider = new GoogleAuthProvider();
+      await signInWithPopup(auth, provider);
+      setCredentials({ email: '', password: '' });
+      setLoginError('');
+      setAuthNotice('');
+      setShowLoginModal(false);
+    } catch (error) {
+      const code = error?.code || 'auth/unknown';
+      if (code === 'auth/popup-closed-by-user') {
+        setLoginError('Google sign-in popup was closed.');
+      } else {
+        setLoginError('Google sign-in failed. Please try again.');
+      }
+    } finally {
+      setAuthSubmitting(false);
     }
   };
 
@@ -149,22 +400,183 @@ function App() {
     }
   };
 
+  const doctorsByCity = {
+    delhi: [
+      'Dr. Rajesh Kumar (General Physician) - New Delhi - Rating 4.8',
+      'Dr. Neha Verma (Internal Medicine) - Dwarka, Delhi - Rating 4.7',
+    ],
+    mumbai: [
+      'Dr. Ananya Sharma (General Practitioner) - Mumbai - Rating 4.9',
+      'Dr. Pratik Joshi (Internal Medicine) - Andheri, Mumbai - Rating 4.7',
+    ],
+    bangalore: [
+      'Dr. Kavya Rao (General Physician) - Indiranagar, Bangalore - Rating 4.8',
+      'Dr. Harish N (Internal Medicine) - Whitefield, Bangalore - Rating 4.7',
+    ],
+    hyderabad: [
+      'Dr. Akhil Reddy (General Physician) - Gachibowli, Hyderabad - Rating 4.8',
+      'Dr. S. Madhavi (Internal Medicine) - Banjara Hills, Hyderabad - Rating 4.7',
+    ],
+    chennai: [
+      'Dr. Priya Narayanan (General Physician) - Adyar, Chennai - Rating 4.8',
+      'Dr. Karthik S (Internal Medicine) - T Nagar, Chennai - Rating 4.6',
+    ],
+  };
+
+  const detectCity = (text) => {
+    const lower = text.toLowerCase();
+    const cities = Object.keys(doctorsByCity);
+    return cities.find((city) => lower.includes(city)) || null;
+  };
+
+  const formatCarePlan = ({
+    condition,
+    severity,
+    specialist,
+    remedies,
+    diet,
+    warnings,
+    city,
+  }) => {
+    const doctorList = city && doctorsByCity[city] ? doctorsByCity[city] : [
+      'Dr. Rajesh Kumar (General Physician) - Rating 4.8',
+      'Dr. Ananya Sharma (Internal Medicine) - Rating 4.9',
+    ];
+
+    const nearbyTitle = city
+      ? `Nearby Specialist Doctors (${city[0].toUpperCase()}${city.slice(1)})`
+      : 'Nearby Specialist Doctors';
+
+    return [
+      `Likely Condition: ${condition}`,
+      `Severity: ${severity}`,
+      `Recommended Specialist: ${specialist}`,
+      '',
+      'Home Remedies:',
+      ...remedies.map((item, index) => `${index + 1}. ${item}`),
+      '',
+      'Diet Guidance:',
+      ...diet.map((item, index) => `${index + 1}. ${item}`),
+      '',
+      `${nearbyTitle}:`,
+      ...doctorList.map((item, index) => `${index + 1}. ${item}`),
+      '',
+      'Warning Signs (seek medical care immediately):',
+      ...warnings.map((item, index) => `${index + 1}. ${item}`),
+      '',
+      'Note: This is general guidance, not a confirmed diagnosis.',
+    ].join('\n');
+  };
+
   const generateAiReply = (userText) => {
     const lower = userText.toLowerCase();
+    const city = detectCity(lower);
 
     if (lower.includes('fever') || lower.includes('cold')) {
-      return 'This could be a mild viral infection. Keep hydrated, take proper rest, and monitor your temperature. If fever lasts more than 3 days, consult a doctor.';
+      return formatCarePlan({
+        condition: 'Viral Fever / Flu-like Illness',
+        severity: 'Moderate',
+        specialist: 'General Physician',
+        city,
+        remedies: [
+          'Take proper rest and avoid overexertion.',
+          'Drink warm fluids and oral rehydration liquids.',
+          'Use a lukewarm sponge if temperature rises.',
+          'Track temperature every 6 to 8 hours.',
+        ],
+        diet: [
+          'Khichdi, dal soup, vegetable soup, and soft foods.',
+          'Coconut water, lemon water, and warm herbal teas.',
+          'Avoid fried, spicy, and packaged foods.',
+          'Small frequent meals instead of heavy meals.',
+        ],
+        warnings: [
+          'Fever above 102 F for more than 3 days.',
+          'Breathing difficulty or chest pain.',
+          'Persistent vomiting or signs of dehydration.',
+          'Confusion, severe weakness, or fainting.',
+        ],
+      });
     }
 
     if (lower.includes('headache')) {
-      return 'Try hydration, rest, and reducing screen exposure. If headache is severe, frequent, or associated with vision changes, consult a clinician.';
+      return formatCarePlan({
+        condition: 'Tension Headache / Migraine Trigger',
+        severity: 'Mild to Moderate',
+        specialist: 'Neurologist or General Physician',
+        city,
+        remedies: [
+          'Rest in a quiet, low-light room.',
+          'Hydrate well and reduce screen time for a few hours.',
+          'Use a cold or warm compress on forehead/neck.',
+          'Maintain regular sleep schedule.',
+        ],
+        diet: [
+          'Drink enough water through the day.',
+          'Do not skip meals; include fruits and nuts.',
+          'Limit caffeine and avoid processed foods.',
+          'Avoid foods that trigger headaches (if known).',
+        ],
+        warnings: [
+          'Sudden severe worst-ever headache.',
+          'Headache with weakness, slurred speech, or vision loss.',
+          'Headache after head injury.',
+          'Headache with persistent vomiting or high fever.',
+        ],
+      });
     }
 
     if (lower.includes('stomach') || lower.includes('nausea')) {
-      return 'Take small sips of water and light food. If you cannot keep fluids down or symptoms worsen, seek medical attention.';
+      return formatCarePlan({
+        condition: 'Acidity / Gastritis / Mild Gastroenteritis',
+        severity: 'Mild to Moderate',
+        specialist: 'Gastroenterologist or General Physician',
+        city,
+        remedies: [
+          'Take small sips of water frequently.',
+          'Rest and avoid heavy physical activity.',
+          'Use oral rehydration solution if loose motions occur.',
+          'Avoid lying down right after meals.',
+        ],
+        diet: [
+          'Banana, toast, rice, curd, and simple khichdi.',
+          'Clear soups and electrolyte fluids.',
+          'Avoid oily, spicy, dairy-heavy, and street foods.',
+          'Eat small portions every 3 to 4 hours.',
+        ],
+        warnings: [
+          'Blood in stool or vomit.',
+          'Severe abdominal pain or persistent vomiting.',
+          'No urine output / severe dehydration signs.',
+          'Symptoms not improving after 24 to 48 hours.',
+        ],
+      });
     }
 
-    return 'I can provide general guidance only and not a diagnosis. If symptoms are severe, persistent, or worsening, please consult a qualified doctor.';
+    return formatCarePlan({
+      condition: 'Needs Further Symptom Details',
+      severity: 'Undetermined',
+      specialist: 'General Physician',
+      city,
+      remedies: [
+        'Rest, hydrate, and monitor symptoms closely.',
+        'Track temperature, pain level, and duration.',
+        'Avoid self-medication beyond basic OTC guidance.',
+        'Seek doctor consultation if symptoms persist.',
+      ],
+      diet: [
+        'Simple, easy-to-digest home-cooked meals.',
+        'Adequate fluids and electrolyte intake.',
+        'Avoid junk, oily, and highly processed foods.',
+        'Prefer fruits, soups, and light proteins.',
+      ],
+      warnings: [
+        'Severe pain, breathing issue, or high fever.',
+        'Rapid worsening of symptoms.',
+        'Persistent vomiting, fainting, or confusion.',
+        'Any emergency symptoms requiring urgent care.',
+      ],
+    });
   };
 
   const handleChatSend = () => {
@@ -208,12 +620,53 @@ function App() {
   }
 
   if (!showApp) {
-    return <LandingPage onStart={() => setShowApp(true)} />;
+    return (
+      <>
+        <LandingPage
+          onStart={() => setShowApp(true)}
+          onLogin={() => {
+            setAuthMode('login');
+            setShowLoginModal(true);
+          }}
+        />
+        {!isAuthenticated && (
+          <LoginModal
+            show={showLoginModal}
+            authMode={authMode}
+            authSubmitting={authSubmitting}
+            authUser={authUser}
+            credentials={credentials}
+            otpInput={otpInput}
+            pendingOtp={pendingOtp}
+            error={loginError}
+            notice={authNotice}
+            hasFirebaseConfig={hasFirebaseConfig}
+            onChange={handleCredentialChange}
+            onOtpInputChange={(event) => setOtpInput(event.target.value.replace(/\D/g, '').slice(0, 6))}
+            onSwitchMode={() => {
+              setAuthMode((prev) => (prev === 'login' ? 'signup' : 'login'));
+              setLoginError('');
+              setAuthNotice('');
+            }}
+            onClose={() => {
+              setShowLoginModal(false);
+              setLoginError('');
+              setAuthNotice('');
+            }}
+            onGoogleLogin={handleGoogleLogin}
+            onConfirmOtp={handleConfirmOtp}
+            onResendVerification={handleResendVerification}
+            onSubmit={handleEmailAuth}
+          />
+        )}
+      </>
+    );
   }
 
   if (isAuthenticated) {
     return (
       <ChatInterface
+        authUser={authUser}
         messages={messages}
         chatInput={chatInput}
         setChatInput={setChatInput}
@@ -337,21 +790,56 @@ function App() {
 
       <LoginModal
         show={showLoginModal}
+        authMode={authMode}
+        authSubmitting={authSubmitting}
+        authUser={authUser}
         credentials={credentials}
+        otpInput={otpInput}
+        pendingOtp={pendingOtp}
         error={loginError}
+        notice={authNotice}
         hasFirebaseConfig={hasFirebaseConfig}
         onChange={handleCredentialChange}
+        onOtpInputChange={(event) => setOtpInput(event.target.value.replace(/\D/g, '').slice(0, 6))}
+        onSwitchMode={() => {
+          setAuthMode((prev) => (prev === 'login' ? 'signup' : 'login'));
+          setLoginError('');
+          setAuthNotice('');
+        }}
         onClose={() => {
           setShowLoginModal(false);
           setLoginError('');
+          setAuthNotice('');
         }}
-        onSubmit={handleLogin}
+        onGoogleLogin={handleGoogleLogin}
+        onConfirmOtp={handleConfirmOtp}
+        onResendVerification={handleResendVerification}
+        onSubmit={handleEmailAuth}
       />
     </div>
   );
 }
 
-function LoginModal({ show, credentials, error, hasFirebaseConfig, onChange, onClose, onSubmit }) {
+function LoginModal({
+  show,
+  authMode,
+  authSubmitting,
+  authUser,
+  credentials,
+  otpInput,
+  pendingOtp,
+  error,
+  notice,
+  hasFirebaseConfig,
+  onChange,
+  onOtpInputChange,
+  onSwitchMode,
+  onClose,
+  onGoogleLogin,
+  onConfirmOtp,
+  onResendVerification,
+  onSubmit,
+}) {
   return (
     <AnimatePresence>
       {show && (
@@ -368,7 +856,13 @@ function LoginModal({ show, credentials, error, hasFirebaseConfig, onChange, onC
             onSubmit={onSubmit}
             className="w-full max-w-md bg-white rounded-2xl p-6 shadow-2xl"
           >
-            <h2 className="text-xl font-bold text-slate-800">Login To Continue</h2>
+            <h2 className="text-xl font-bold text-slate-800">
+              {authMode === 'login'
+                ? 'Login To Continue'
+                : authMode === 'signup'
+                ? 'Create New Account'
+                : 'Verify Email OTP'}
+            </h2>
             <p className="text-sm text-slate-500 mt-1">
               Logged in users can access the chat interface.
             </p>
@@ -379,42 +873,124 @@ function LoginModal({ show, credentials, error, hasFirebaseConfig, onChange, onC
               </p>
             )}
 
-            <div className="mt-5 space-y-3">
-              <input
-                type="email"
-                name="email"
-                value={credentials.email}
-                onChange={onChange}
-                placeholder="Email"
-                className="w-full border border-slate-200 rounded-xl px-4 py-2.5 outline-none focus:ring-2 focus:ring-medical-500"
-              />
-              <input
-                type="password"
-                name="password"
-                value={credentials.password}
-                onChange={onChange}
-                placeholder="Password"
-                className="w-full border border-slate-200 rounded-xl px-4 py-2.5 outline-none focus:ring-2 focus:ring-medical-500"
-              />
-            </div>
+            {authMode !== 'verify-otp' ? (
+              <div className="mt-5 space-y-3">
+                <input
+                  type="email"
+                  name="email"
+                  value={credentials.email}
+                  onChange={onChange}
+                  placeholder="Email"
+                  className="w-full border border-slate-200 rounded-xl px-4 py-2.5 outline-none focus:ring-2 focus:ring-medical-500"
+                />
+                <input
+                  type="password"
+                  name="password"
+                  value={credentials.password}
+                  onChange={onChange}
+                  placeholder="Password"
+                  className="w-full border border-slate-200 rounded-xl px-4 py-2.5 outline-none focus:ring-2 focus:ring-medical-500"
+                />
+              </div>
+            ) : (
+              <div className="mt-5 space-y-3">
+                <input
+                  type="email"
+                  name="email"
+                  value={credentials.email}
+                  onChange={onChange}
+                  placeholder="Correct email (if needed)"
+                  className="w-full border border-slate-200 rounded-xl px-4 py-2.5 outline-none focus:ring-2 focus:ring-medical-500"
+                />
+                <input
+                  type="text"
+                  value={otpInput}
+                  onChange={onOtpInputChange}
+                  placeholder="Enter 6-digit OTP"
+                  className="w-full border border-slate-200 rounded-xl px-4 py-2.5 outline-none focus:ring-2 focus:ring-medical-500 tracking-[0.35em]"
+                />
+                <p className="text-xs text-slate-500">
+                  OTP validity: 1 hour 30 minutes.
+                  {pendingOtp?.expiresAt ? ` Expires at ${new Date(pendingOtp.expiresAt).toLocaleTimeString()}.` : ''}
+                </p>
+              </div>
+            )}
 
             {error && <p className="text-sm text-rose-600 mt-3">{error}</p>}
+            {notice && <p className="text-sm text-emerald-700 mt-3">{notice}</p>}
+
+            {authUser && !authUser.emailVerified && authMode === 'login' && (
+              <button
+                type="button"
+                onClick={onResendVerification}
+                disabled={authSubmitting}
+                className="mt-3 w-full rounded-xl border border-amber-300 bg-amber-50 py-2.5 text-amber-700 hover:bg-amber-100 disabled:opacity-60"
+              >
+                Resend Verification Email
+              </button>
+            )}
 
             <div className="mt-6 flex gap-3">
               <button
                 type="button"
                 onClick={onClose}
+                disabled={authSubmitting}
                 className="flex-1 rounded-xl border border-slate-200 py-2.5 text-slate-700"
               >
                 Cancel
               </button>
-              <button
-                type="submit"
-                className="flex-1 rounded-xl bg-medical-600 text-white py-2.5 hover:bg-medical-500"
-              >
-                Login
-              </button>
+              {authMode !== 'verify-otp' ? (
+                <button
+                  type="submit"
+                  disabled={authSubmitting}
+                  className="flex-1 rounded-xl bg-medical-600 text-white py-2.5 hover:bg-medical-500 disabled:bg-slate-300"
+                >
+                  {authSubmitting ? 'Please wait...' : authMode === 'login' ? 'Login' : 'Sign Up'}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={onConfirmOtp}
+                  disabled={authSubmitting}
+                  className="flex-1 rounded-xl bg-medical-600 text-white py-2.5 hover:bg-medical-500 disabled:bg-slate-300"
+                >
+                  Confirm OTP
+                </button>
+              )}
             </div>
+
+            {authMode !== 'verify-otp' && (
+              <button
+                type="button"
+                onClick={onGoogleLogin}
+                disabled={authSubmitting || !hasFirebaseConfig}
+                className="mt-3 w-full rounded-xl border border-slate-200 py-2.5 text-slate-700 hover:bg-slate-50 disabled:text-slate-400"
+              >
+                Continue With Google
+              </button>
+            )}
+
+            {authMode === 'verify-otp' && (
+              <button
+                type="button"
+                onClick={onResendVerification}
+                disabled={authSubmitting}
+                className="mt-3 w-full rounded-xl border border-slate-200 py-2.5 text-slate-700 hover:bg-slate-50 disabled:text-slate-400"
+              >
+                Resend OTP (after expiry) / Correct Email
+              </button>
+            )}
+
+            {authMode !== 'verify-otp' && (
+              <button
+                type="button"
+                onClick={onSwitchMode}
+                disabled={authSubmitting}
+                className="mt-4 w-full text-sm text-medical-700 hover:text-medical-600"
+              >
+                {authMode === 'login' ? 'No account? Sign up' : 'Already have an account? Login'}
+              </button>
+            )}
           </motion.form>
         </motion.div>
       )}
@@ -422,11 +998,14 @@ function LoginModal({ show, credentials, error, hasFirebaseConfig, onChange, onC
   );
 }
 
-function ChatInterface({ messages, chatInput, setChatInput, loading, onSend, onKeyDown, onLogout, endRef }) {
+function ChatInterface({ authUser, messages, chatInput, setChatInput, loading, onSend, onKeyDown, onLogout, endRef }) {
   return (
     <div className="h-screen w-full bg-slate-100 flex flex-col">
       <header className="h-16 border-b bg-white flex items-center justify-between px-4">
-        <h1 className="font-semibold text-slate-800">DoctorGPT Chat</h1>
+        <div>
+          <h1 className="font-semibold text-slate-800">DoctorGPT Chat</h1>
+          <p className="text-xs text-slate-500">{authUser?.email || 'Authenticated user'}</p>
+        </div>
         <button
           onClick={onLogout}
           className="text-sm px-3 py-1.5 rounded-lg border border-slate-200 text-slate-700 hover:bg-slate-100"
@@ -445,7 +1024,7 @@ function ChatInterface({ messages, chatInput, setChatInput, loading, onSend, onK
               className={`max-w-[85%] rounded-2xl px-4 py-2.5 text-sm transition-all ${
                 message.role === 'user'
                   ? 'bg-slate-900 text-white rounded-br-md'
-                  : 'bg-white text-slate-800 border border-slate-200 rounded-bl-md'
+                  : 'bg-white text-slate-800 border border-slate-200 rounded-bl-md whitespace-pre-wrap leading-relaxed'
               }`}
             >
               {message.text}
