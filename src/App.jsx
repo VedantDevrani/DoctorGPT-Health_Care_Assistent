@@ -70,6 +70,8 @@ function App() {
   const [chatInput, setChatInput] = useState('');
   const chatEndRef = useRef(null);
 
+  const profileName = authUser?.displayName || authUser?.email?.split('@')[0] || 'User';
+
   useEffect(() => {
     if (pendingOtp) {
       writeJsonStorage(OTP_PENDING_STORAGE_KEY, pendingOtp);
@@ -628,6 +630,9 @@ function App() {
             setAuthMode('login');
             setShowLoginModal(true);
           }}
+          onLogout={handleLogout}
+          isAuthenticated={isAuthenticated}
+          profileName={profileName}
         />
         {!isAuthenticated && (
           <LoginModal

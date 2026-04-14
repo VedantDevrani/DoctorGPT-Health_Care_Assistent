@@ -2,7 +2,7 @@ import React from 'react';
 import { motion } from 'framer-motion';
 import { Activity, ShieldCheck, Stethoscope, Home, ChevronRight, Check } from 'lucide-react';
 
-const LandingPage = ({ onStart, onLogin }) => {
+const LandingPage = ({ onStart, onLogin, onLogout, isAuthenticated, profileName }) => {
   return (
     <div className="min-h-screen bg-white text-slate-900 font-sans selection:bg-medical-100 selection:text-medical-900">
       {/* Header/Nav */}
@@ -14,17 +14,35 @@ const LandingPage = ({ onStart, onLogin }) => {
           <span className="text-xl font-bold tracking-tight text-slate-800">DoctorGPT</span>
         </div>
         <div className="flex items-center gap-2">
-          <button
-            onClick={onLogin}
-            className="px-4 py-2 rounded-full border border-slate-300 text-slate-700 text-sm font-semibold hover:bg-slate-100 transition-all active:scale-95"
-          >
-            Login / Sign Up
-          </button>
+          {isAuthenticated && (
+            <div className="hidden sm:flex items-center gap-2 px-3 py-2 rounded-full border border-slate-300 bg-white text-slate-700 text-sm font-semibold">
+              <div className="w-7 h-7 rounded-full bg-medical-100 text-medical-700 flex items-center justify-center text-xs font-bold">
+                {(profileName || 'U').slice(0, 1).toUpperCase()}
+              </div>
+              <span className="max-w-[140px] truncate">{profileName}</span>
+            </div>
+          )}
+
+          {isAuthenticated ? (
+            <button
+              onClick={onLogout}
+              className="px-4 py-2 rounded-full border border-slate-300 text-slate-700 text-sm font-semibold hover:bg-slate-100 transition-all active:scale-95"
+            >
+              Logout
+            </button>
+          ) : (
+            <button
+              onClick={onLogin}
+              className="px-4 py-2 rounded-full border border-slate-300 text-slate-700 text-sm font-semibold hover:bg-slate-100 transition-all active:scale-95"
+            >
+              Login / Sign Up
+            </button>
+          )}
           <button
             onClick={onStart}
             className="px-5 py-2 rounded-full bg-slate-900 text-white text-sm font-semibold hover:bg-slate-800 transition-all active:scale-95"
           >
-            Open App
+            {isAuthenticated ? 'Open Chat' : 'Open App'}
           </button>
         </div>
       </nav>
@@ -60,17 +78,19 @@ const LandingPage = ({ onStart, onLogin }) => {
                 transition={{ duration: 0.6, delay: 0.2 }}
                 className="flex flex-col sm:flex-row items-center gap-4 justify-center lg:justify-start"
               >
-                <button
-                  onClick={onLogin}
-                  className="w-full sm:w-auto px-6 py-4 rounded-2xl border border-slate-300 text-slate-700 font-bold text-lg hover:bg-slate-100 transition-all"
-                >
-                  Login / Sign Up
-                </button>
+                {!isAuthenticated && (
+                  <button
+                    onClick={onLogin}
+                    className="w-full sm:w-auto px-6 py-4 rounded-2xl border border-slate-300 text-slate-700 font-bold text-lg hover:bg-slate-100 transition-all"
+                  >
+                    Login / Sign Up
+                  </button>
+                )}
                 <button
                   onClick={onStart}
                   className="w-full sm:w-auto px-8 py-4 rounded-2xl medical-gradient text-white font-bold text-lg shadow-xl shadow-medical-200 flex items-center justify-center gap-2 group hover:shadow-2xl hover:-translate-y-1 transition-all"
                 >
-                  Start Checking Symptoms <ChevronRight size={20} className="group-hover:translate-x-1 transition-transform" />
+                  {isAuthenticated ? 'Go To Chat' : 'Start Checking Symptoms'} <ChevronRight size={20} className="group-hover:translate-x-1 transition-transform" />
                 </button>
                 <div className="flex -space-x-2">
                   {[1, 2, 3, 4].map((i) => (
